@@ -117,7 +117,8 @@ scm_version()
 			git --no-optional-locks status -uno --porcelain 2>/dev/null ||
 			git diff-index --name-only HEAD
 		} | grep -qvE '^(.. )?scripts/package'; then
-			printf '%s' -dirty
+			# printf '%s' -dirty
+			printf '%s' ''
 		fi
 
 		# All done with git
@@ -141,7 +142,8 @@ scm_version()
 		# Are there uncommitted changes?
 		# These are represented by + after the changeset id.
 		case "$hgid" in
-			*+|*+\ *) printf '%s' -dirty ;;
+			# *+|*+\ *) printf '%s' -dirty ;;
+			*+|*+\ *) printf '%s' '' ;;
 		esac
 
 		# All done with mercurial
@@ -219,4 +221,8 @@ if test -n "${BUILD_NUMBER}"; then
 	res="$res-ab${BUILD_NUMBER}"
 fi
 
-echo "$res"
+
+# 要直接改 kernel release 字符串的话，打开文件 $KERNEL_ROOT/scripts/setlocalversion，
+# 找到最后一行 echo "$res"，例如替换成 echo "-android13-01-gb123456789012-ab12345678"
+# echo "$res"
+echo "-android13-8-gca30f3b4bef6-abogki440974771-4k"

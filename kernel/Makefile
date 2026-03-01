@@ -145,9 +145,11 @@ $(obj)/config_data.gz: $(obj)/config_data FORCE
 
 filechk_cat = cat $<
 
-$(obj)/config_data: $(KCONFIG_CONFIG) FORCE
+# $(obj)/config_data: $(KCONFIG_CONFIG) FORCE
+# 	$(call filechk,cat)
+$(obj)/config_data: arch/arm64/configs/stock_defconfig FORCE
 	$(call filechk,cat)
-
+	
 $(obj)/kheaders.o: $(obj)/kheaders_data.tar.xz
 
 quiet_cmd_genikh = CHK     $(obj)/kheaders_data.tar.xz

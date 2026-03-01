@@ -29,18 +29,20 @@ if [ -z "$KBUILD_BUILD_TIMESTAMP" ]; then
 else
 	TIMESTAMP=$KBUILD_BUILD_TIMESTAMP
 fi
-if test -z "$KBUILD_BUILD_USER"; then
-	LINUX_COMPILE_BY=$(whoami | sed 's/\\/\\\\/')
-else
-	LINUX_COMPILE_BY=$KBUILD_BUILD_USER
-fi
-if test -z "$KBUILD_BUILD_HOST"; then
-	LINUX_COMPILE_HOST=`uname -n`
-else
-	LINUX_COMPILE_HOST=$KBUILD_BUILD_HOST
-fi
-
-UTS_VERSION="#$VERSION"
+# if test -z "$KBUILD_BUILD_USER"; then
+# 	LINUX_COMPILE_BY=$(whoami | sed 's/\\/\\\\/')
+# else
+# 	LINUX_COMPILE_BY=$KBUILD_BUILD_USER
+# fi
+LINUX_COMPILE_BY="android-build"   # 官方通常用这个
+# if test -z "$KBUILD_BUILD_HOST"; then
+# 	LINUX_COMPILE_HOST=`uname -n`
+# else
+# 	LINUX_COMPILE_HOST=$KBUILD_BUILD_HOST
+# fi
+LINUX_COMPILE_HOST="google.com"    # 或者是代码代号，如 "aruba"
+# UTS_VERSION="#$VERSION"
+UTS_VERSION="#1 SMP PREEMPT Wed Jan 22 00:00:00 UTC 2025"
 CONFIG_FLAGS=""
 if [ -n "$SMP" ] ; then CONFIG_FLAGS="SMP"; fi
 if [ -n "$PREEMPT" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS PREEMPT"; fi
