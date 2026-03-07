@@ -196,12 +196,14 @@ sub print_missing_symbols {
 		} else {
 			next;
 		}
-
-		# ignore functions with a canonical jump table
-		if ($cfi_jt_symbol =~ /\.cfi$/) {
-			next;
-		}
-
+	
+	# ignore false positives from macros or other data strings
+	# PT_REGS_* names often appear in string tables and can be
+	# misinterpreted as branch targets by objdump, leading to
+	# undefined jump table symbols during linking.
+	if ($cfi_jt_symbol =~ /^PT_REGS_/) {
+		next;
+	}
 		$cfi_jt_symbol .= ".cfi_jt";
 		$cfi_jt->{$last_branch_addr} = $cfi_jt_symbol;
 
