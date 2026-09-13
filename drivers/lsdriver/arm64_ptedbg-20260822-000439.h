@@ -1,25 +1,22 @@
 #ifndef ARM64_PTEDBG_H
 #define ARM64_PTEDBG_H
-/*
-直接patch为brk,页不能访问伪造读+系统调用伪造
 
+/*
+直接patch为udf,页不能访问伪造读返回
 */
 
-#include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
-#include <linux/uio.h>
-#include <linux/wait.h>
 #include <asm/esr.h>
 #include <asm/memory.h>
+#include <asm/mman.h>
 #include <asm/ptrace.h>
-#include <uapi/asm/unistd.h>
 
-#include "arm64_encode/arm64_encode.h"
 #include "arm64_reg.h"
 #include "export_fun.h"
 #include "inline_hook_frame.h"
@@ -27,7 +24,13 @@
 #include "arm64_emulate/emulate_inst.h"
 #include "virtual_memory_rw.h"
 
-#define PTEBP_BRK_MARKER_BASE 0xA500U
+#ifndef ARCH_VM_PKEY_FLAGS
+#define ARCH_VM_PKEY_FLAGS 0
+#endif
+
+#define PTEBP_UDF_INST     0x00000000U
+#define PTEBP_IC_IVAU_MASK 0xFFFFFFE0U
+#define PTEBP_IC_IVAU_INST 0xD50B7520U
 
 static inline uint8_t ptebp_instruction_bytes(const struct arm64_decoded_instruction *decoded)
 {
@@ -36,61 +39,26 @@ static inline uint8_t ptebp_instruction_bytes(const struct arm64_decoded_instruc
     case ARM64_INST_LDAPURSB: return 1;
     case ARM64_INST_LDAPURSH: return 2;
     case ARM64_INST_LDAPURSW: return 4;
-    default: break;
+    case ARM64_INST_LDRSW_LITERAL: return 4;
+    default:
+        return decoded->operand_width ? (uint8_t)(decoded->operand_width / 8) : 0;
     }
-    return decoded->operand_width ? (uint8_t)(decoded->operand_width / 8) : 0;
-}
-
-static inline bool ptebp_gpr_single_leaf(uint32_t raw_inst)
-{
-    uint32_t owner = (raw_inst >> 24) & 0x3F;
-
-    if (owner == 0x39) return true;
-    if (owner != 0x38) return false;
-    return !(raw_inst & 0x00200000U) || ((raw_inst >> 10) & 0x3) == 2;
 }
 
 struct ptebp_slot
 {
-    pte_t orig_pte;       // 页面安装数据保护前的原始 PTE，同页多个断点共享该快照。
-    uint64_t hook_addr;   // 去除地址标签并按 4 字节对齐后的断点虚拟地址。
-    uint64_t page_vaddr;  // hook_addr 所在页的页首虚拟地址。
-    uint32_t orig_inst;   // 被 BRK 覆盖的原始指令，也是数据读取时返回的逻辑内容。
-    uint32_t marker_inst; // 本槽位独占的 BRK immediate 标识，用于缓冲区内容匹配。
+    pte_t orig_pte;
+    uint64_t hook_addr;
+    uint64_t page_vaddr;
+    uint32_t orig_inst;
 };
 
-// 当前只允许存在一组 PTEBP 监控；配置、目标 mm 和槽位状态由同一把锁保护。
 static struct break_point *g_ptebp_info;
 static struct mm_struct *g_ptebp_mm;
 static struct ptebp_slot g_ptebp_slots[BP_CONFIG_MAX];
 static DEFINE_SPINLOCK(g_ptebp_lock);
-// 标记整组撤销已经开始，避免多个停止或异常回退路径重复执行恢复流程。
 static bool g_ptebp_stopping;
-static atomic_t g_ptebp_syscall_returns_inflight = ATOMIC_INIT(0);
-static DECLARE_WAIT_QUEUE_HEAD(g_ptebp_syscall_return_wait);
 
-static bool ptebp_marker_slot_from_comment(uint32_t comment, size_t *slot_index)
-{
-    if (comment < PTEBP_BRK_MARKER_BASE || comment >= PTEBP_BRK_MARKER_BASE + ARRAY_SIZE(g_ptebp_slots)) return false;
-    if (slot_index) *slot_index = comment - PTEBP_BRK_MARKER_BASE;
-    return true;
-}
-
-static bool ptebp_marker_slot_from_inst(uint32_t inst, size_t *slot_index)
-{
-    if ((inst & 0xFFE0001FU) != 0xD4200000U) return false;
-    return ptebp_marker_slot_from_comment((inst >> 5) & 0xFFFFU, slot_index);
-}
-
-/* ======================== PTE/PFN 基础操作 ======================== */
-
-/*
-构造受管页的数据保护 PTE。
-不修改 UXN/PXN 等执行属性，只通过 AP、只读和 DBM 相关位撤销 EL0 数据访问。
-这样 CPU 可以继续从原页面原生取指；普通用户态 load/store 会进入 DABT permission fault。
-内核的 copy_from_user() 若或其他使用 LDTR/STTR 等非特权访存指令，也会按 EL0 权限检查并进入 DABT；
-这里禁止的EL1非特权用户拷贝，EL1 的特权指令还是可以访问
-*/
 static inline pteval_t ptebp_make_data_guard_pte(pteval_t value)
 {
 #ifdef PTE_USER
@@ -109,10 +77,6 @@ static inline pteval_t ptebp_make_data_guard_pte(pteval_t value)
     return value;
 }
 
-/*
-手动遍历目标 mm 页表取得断点指令的物理地址，不依赖受管页当前的 EL0 数据权限。
-写入后同步全部 CPU 的指令缓存并回读校验，确保 BRK 或原始指令已经真实落到代码页。
-*/
 static inline int ptebp_access_inst(struct ptebp_slot *slot, uint32_t *inst, bool write)
 {
     phys_addr_t paddr;
@@ -175,7 +139,7 @@ static bool ptebp_monitor_active_locked(struct mm_struct *mm)
     return g_ptebp_info && g_ptebp_mm == mm;
 }
 
-// 调用方持有 g_ptebp_lock；源槽位失配会破坏 BRK 归属，因此拒绝继续模拟。
+// 调用方持有 g_ptebp_lock；源槽位失配会破坏 UDF 归属，因此拒绝继续模拟。
 static bool ptebp_all_slots_valid_locked(struct mm_struct *mm)
 {
     for (size_t slot_index = 0; slot_index < ARRAY_SIZE(g_ptebp_slots); slot_index++)
@@ -271,7 +235,7 @@ out_unlock:
 /*
 读取已经确认由本模块 guard PTE 触发 DABT 的数据。
 访问跨页时逐页翻译并读取，不要求整个范围都位于受管页，也不假设虚拟相邻页物理连续；
-读取范围覆盖断点时，用对应 orig_inst 字节替换物理页中的 BRK 字节。
+读取范围覆盖断点时，用对应 orig_inst 字节补齐读取视图，确保返回目标进程最新写入内容。
 */
 static int ptebp_emu_read_mem(uint64_t addr, int bytes, __uint128_t *out)
 {
@@ -313,27 +277,42 @@ out_unlock:
     return status;
 }
 
-// DABT store 保持原始写语义；覆盖 marker 后该断点失效，重新安装监控即可恢复。
+// DABT store 在整个访问范围内原样写入；覆盖断点时只额外同步槽位保存的逻辑指令。
 static int ptebp_emu_write_mem(uint64_t addr, int bytes, __uint128_t value)
 {
-    uint8_t data[sizeof(value)];
+    uint8_t write_data[sizeof(__uint128_t)];
+    uint32_t updated_orig_inst[BP_CONFIG_MAX];
+    bool slot_updated[BP_CONFIG_MAX] = {false};
     struct ptebp_physical_chunk chunks[2];
+    uint64_t end;
     size_t chunk_count;
     unsigned long flags;
     int status;
 
     status = ptebp_emu_prepare_range(addr, bytes, &addr);
     if (status) return status;
-
-    __builtin_memcpy(data, &value, bytes);
+    end = addr + (uint64_t)bytes;
+    __builtin_memcpy(write_data, &value, bytes);
 
     spin_lock_irqsave(&g_ptebp_lock, flags);
+    for (size_t slot_index = 0; slot_index < ARRAY_SIZE(g_ptebp_slots); slot_index++)
+    {
+        struct ptebp_slot *slot = &g_ptebp_slots[slot_index];
+        struct ptebp_slot_overlap overlap;
+
+        if (!slot->hook_addr || !ptebp_get_patch_overlap(slot->hook_addr, sizeof(slot->orig_inst), addr, end, &overlap)) continue;
+
+        updated_orig_inst[slot_index] = slot->orig_inst;
+        __builtin_memcpy((uint8_t *)&updated_orig_inst[slot_index] + overlap.inst_offset, write_data + overlap.data_offset, overlap.copy_size);
+        slot_updated[slot_index] = true;
+    }
+
     status = ptebp_emu_translate_range(addr, bytes, chunks, &chunk_count);
     if (status) goto out_unlock;
 
     for (size_t chunk_index = 0; chunk_index < chunk_count; chunk_index++)
     {
-        status = linear_write_physical(chunks[chunk_index].paddr, data + chunks[chunk_index].data_offset, chunks[chunk_index].size);
+        status = linear_write_physical(chunks[chunk_index].paddr, write_data + chunks[chunk_index].data_offset, chunks[chunk_index].size);
         if (status) goto out_unlock;
     }
     for (size_t chunk_index = 0; chunk_index < chunk_count; chunk_index++)
@@ -341,6 +320,10 @@ static int ptebp_emu_write_mem(uint64_t addr, int bytes, __uint128_t value)
         status = arm64_sync_code_range_all_cpus(phys_to_virt(chunks[chunk_index].paddr), chunks[chunk_index].size);
         if (status) goto out_unlock;
     }
+
+    for (size_t slot_index = 0; slot_index < ARRAY_SIZE(g_ptebp_slots); slot_index++)
+        if (slot_updated[slot_index]) g_ptebp_slots[slot_index].orig_inst = updated_orig_inst[slot_index];
+
 out_unlock:
     spin_unlock_irqrestore(&g_ptebp_lock, flags);
     return status;
@@ -351,13 +334,14 @@ out_unlock:
 /*
 guard PTE 主动撤销受管页的数据访问权限，因此这里处理的 DABT 并非原指令本身非法，
 而是原本合法的 load/store 访问受管页时被监控机制主动中断。
-为使 BRK 补丁和 guard PTE 保持安装状态、监控能够继续运行，必须模拟并提交整条原始指令，
+为使 UDF 补丁和 guard PTE 保持安装状态、监控能够继续运行，必须模拟并提交整条原始指令，
 包括完整数据读写、目标寄存器结果、基址写回和 PC 推进；跨页访问也按原指令的完整范围处理。
 
 按 decoder 给出的架构语义提交一条普通 load/store：
 - 成功时更新目标 GPR 或 FP/SIMD 寄存器、基址回写，并把 PC 推进 4 字节；
 - pair store 合并为一次写入，避免第一元素成功、第二元素失败造成部分副作用；
 - prefetch 没有架构可见的数据结果，直接推进 PC；
+- IC IVAU 将 Xt 指定的用户 VA 翻译到物理别名后执行缓存同步；
 - exclusive、CAS/CASP、LSE RMW、SWP 等原子指令没有 case，返回 SKIP 触发整组回退。
 */
 static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint32_t raw_inst)
@@ -367,8 +351,23 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
     uint64_t pc = regs->pc;
     uint64_t base, address;
 
-    if (arm64_decode_instruction(raw_inst, &decoded_result) != ARM64_DECODE_OK) return EMU_INST_SKIP;
+    if ((raw_inst & PTEBP_IC_IVAU_MASK) == PTEBP_IC_IVAU_INST)
+    {
+        phys_addr_t paddr;
 
+        // IC IVAU, Xt 按 Xt 给出的用户 VA 失效对应指令缓存行；Rt=31 按 XZR 读取为 0。
+        address = untagged_addr(read_gpr_or_zr(regs, raw_inst & 0x1FU));
+        if (!current->mm || address >= READ_ONCE(current->mm->task_size)) goto emulate_failed;
+        if (walk_translate_va_to_pa(current->mm, address, &paddr)) goto emulate_failed;
+
+        // guard PTE 阻止直接使用用户 VA，改用同一物理位置的内核线性别名完成 D-cache 清理和 I-cache 失效。
+        if (arm64_sync_code_range_all_cpus(phys_to_virt(paddr), 1)) goto emulate_failed;
+
+        regs->pc = pc + 4;
+        return EMU_INST_HANDLED;
+    }
+
+    if (arm64_decode_instruction(raw_inst, &decoded_result) != ARM64_DECODE_OK) goto emulate_failed;
     // Prefetch (PRFM) 无实际内存数据交互，直接推进 PC 并返回
     switch (decoded->instruction)
     {
@@ -382,19 +381,20 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
         break;
     }
 
-    if (ptebp_gpr_single_leaf(raw_inst))
+    uint32_t owner = (raw_inst >> 24) & 0x3F;
+
+    if (owner == 0x39 || (owner == 0x38 && (!(raw_inst & 0x00200000U) || ((raw_inst >> 10) & 0x3) == 2)))
     {
-        uint32_t owner = (raw_inst >> 24) & 0x3F;
         uint32_t mode = (raw_inst >> 10) & 0x3;
         uint32_t opc = (raw_inst >> 22) & 0x3;
         uint8_t bytes = 1U << ((raw_inst >> 30) & 0x3);
         bool register_offset = owner == 0x38 && (raw_inst & 0x00200000U);
         __uint128_t value;
 
-        base = addr_reg_read(regs, decoded->rn);
+        base = read_gpr_or_sp(regs, decoded->rn);
         if (register_offset)
         {
-            uint64_t index = reg_read(regs, decoded->rm);
+            uint64_t index = read_gpr_or_zr(regs, decoded->rm);
 
             switch (decoded->extend_type)
             {
@@ -402,7 +402,7 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
             case 3: break;
             case 6: index = (uint64_t)(int64_t)(int32_t)index; break;
             case 7: break;
-            default: return EMU_INST_SKIP;
+            default: goto emulate_failed;
             }
             address = base + (index << decoded->shift_amount);
         }
@@ -414,15 +414,15 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
         ls_log_always_tag("ptebp", "emulate pc=0x%llx inst=0x%08x type=%d bytes=%u addr=0x%llx\n", (unsigned long long)pc, raw_inst, (int)decoded->instruction, (unsigned int)bytes, (unsigned long long)address);
         if (opc == 0)
         {
-            if (ptebp_emu_write_mem(address, bytes, reg_read(regs, decoded->rt))) return EMU_INST_SKIP;
+            if (ptebp_emu_write_mem(address, bytes, read_gpr_or_zr(regs, decoded->rt))) goto emulate_failed;
         }
         else
         {
-            if (ptebp_emu_read_mem(address, bytes, &value)) return EMU_INST_SKIP;
-            reg_write(regs, decoded->rt, opc >= 2 ? sign_extend64((uint64_t)value, bytes * 8 - 1) : (uint64_t)value, decoded->operand_width == 64);
+            if (ptebp_emu_read_mem(address, bytes, &value)) goto emulate_failed;
+            write_gpr_or_zr(regs, decoded->rt, opc >= 2 ? sign_extend64((uint64_t)value, bytes * 8 - 1) : (uint64_t)value, decoded->operand_width == 64);
         }
 
-        if (owner == 0x38 && !register_offset && (mode == 1 || mode == 3)) addr_reg_write(regs, decoded->rn, base + decoded->offset);
+        if (owner == 0x38 && !register_offset && (mode == 1 || mode == 3)) write_gpr_or_sp(regs, decoded->rn, base + decoded->offset);
         regs->pc = pc + 4;
         return EMU_INST_HANDLED;
     }
@@ -430,62 +430,50 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
     // 根据指令形式直接解析目标内存虚拟地址
     switch (decoded->instruction)
     {
-    case ARM64_INST_LDR_LITERAL_GPR:
+    case ARM64_INST_LDR_GPR_LITERAL:
     case ARM64_INST_LDRSW_LITERAL:
-    case ARM64_INST_LDRS_LITERAL_FP_SIMD:
-    case ARM64_INST_LDRD_LITERAL_FP_SIMD:
-    case ARM64_INST_LDRQ_LITERAL_FP_SIMD:
+    case ARM64_INST_LDR_FP_SIMD_LITERAL:
     case ARM64_INST_PRFM_LITERAL:
         address = pc + decoded->offset;
         base = 0;
         break;
+    case ARM64_INST_STRB_GPR_POST_INDEX:
+    case ARM64_INST_STRH_GPR_POST_INDEX:
     case ARM64_INST_STR_GPR_POST_INDEX:
+    case ARM64_INST_LDRB_GPR_POST_INDEX:
+    case ARM64_INST_LDRH_GPR_POST_INDEX:
     case ARM64_INST_LDR_GPR_POST_INDEX:
-    case ARM64_INST_LDR_SIGNED_GPR_POST_INDEX:
-    case ARM64_INST_STRB_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRH_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRB_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRH_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRQ_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDRSB_GPR_POST_INDEX:
+    case ARM64_INST_LDRSH_GPR_POST_INDEX:
+    case ARM64_INST_LDRSW_GPR_POST_INDEX:
+    case ARM64_INST_STR_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDR_FP_SIMD_POST_INDEX:
     case ARM64_INST_STP_GPR_POST_INDEX:
     case ARM64_INST_LDP_GPR_POST_INDEX:
-    case ARM64_INST_STPS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPQ_FP_SIMD_POST_INDEX:
+    case ARM64_INST_STP_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDP_FP_SIMD_POST_INDEX:
     case ARM64_INST_LDPSW_POST_INDEX:
-        base = addr_reg_read(regs, decoded->rn);
+        base = read_gpr_or_sp(regs, decoded->rn);
         address = base;
         break;
+    case ARM64_INST_STRB_GPR_REGISTER_OFFSET:
+    case ARM64_INST_STRH_GPR_REGISTER_OFFSET:
     case ARM64_INST_STR_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRB_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRH_GPR_REGISTER_OFFSET:
     case ARM64_INST_LDR_GPR_REGISTER_OFFSET:
-    case ARM64_INST_LDR_SIGNED_GPR_REGISTER_OFFSET:
-    case ARM64_INST_STRB_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRH_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRS_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRD_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRQ_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRB_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRH_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRS_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRD_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRQ_FP_SIMD_REGISTER_OFFSET:
+    case ARM64_INST_LDRSB_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRSH_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRSW_GPR_REGISTER_OFFSET:
+    case ARM64_INST_STR_FP_SIMD_REGISTER_OFFSET:
+    case ARM64_INST_LDR_FP_SIMD_REGISTER_OFFSET:
     {
-        base = addr_reg_read(regs, decoded->rn);
-        uint64_t index = reg_read(regs, decoded->rm);
+        base = read_gpr_or_sp(regs, decoded->rn);
+        uint64_t index = read_gpr_or_zr(regs, decoded->rm);
         switch (decoded->extend_type)
         {
         case 2: // UXTW
-            base = addr_reg_read(regs, decoded->rn);
-            address = base + decoded->offset;
-            break;
+            index = (uint32_t)index;
             break;
         case 3: // LSL / UXTX
             break;
@@ -495,68 +483,152 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
         case 7: // SXTX
             break;
         default:
-            return EMU_INST_SKIP;
+            goto emulate_failed;
         }
         address = base + (index << decoded->shift_amount);
         break;
     }
     default:
-        return EMU_INST_SKIP;
+        base = read_gpr_or_sp(regs, decoded->rn);
+        address = base + decoded->offset;
+        break;
     }
+
+    // 当前 PC 和原始指令在这里仍然成对可用；后续的读写模拟都由本次解码结果驱动。
+    ls_log_always_tag("ptebp", "emulate pc=0x%llx inst=0x%08x type=%d bytes=%zu addr=0x%llx\n", (unsigned long long)pc, raw_inst, (int)decoded->instruction, (size_t)ptebp_instruction_bytes(decoded), (unsigned long long)address);
 
     // 分类执行数据读写（成功则 break 汇聚到尾部统一提交，失败则 return EMU_INST_SKIP）
     switch (decoded->instruction)
     {
     /* ----- 通用寄存器 (GPR) 单寄存器加载（含 Acquire） ----- */
+    case ARM64_INST_LDLARB:
+    case ARM64_INST_LDLARH:
     case ARM64_INST_LDLAR:
+    case ARM64_INST_LDARB:
+    case ARM64_INST_LDARH:
     case ARM64_INST_LDAR:
+    case ARM64_INST_LDAPRB:
+    case ARM64_INST_LDAPRH:
     case ARM64_INST_LDAPR:
+    case ARM64_INST_LDAPURB:
+    case ARM64_INST_LDAPURH:
     case ARM64_INST_LDAPUR:
-    case ARM64_INST_LDR_LITERAL_GPR:
+    case ARM64_INST_LDR_GPR_LITERAL:
+    case ARM64_INST_LDURB_GPR:
+    case ARM64_INST_LDURH_GPR:
     case ARM64_INST_LDUR_GPR:
+    case ARM64_INST_LDTRB_GPR:
+    case ARM64_INST_LDTRH_GPR:
     case ARM64_INST_LDTR_GPR:
+    case ARM64_INST_LDRB_GPR_POST_INDEX:
+    case ARM64_INST_LDRH_GPR_POST_INDEX:
     case ARM64_INST_LDR_GPR_POST_INDEX:
+    case ARM64_INST_LDRB_GPR_PRE_INDEX:
+    case ARM64_INST_LDRH_GPR_PRE_INDEX:
     case ARM64_INST_LDR_GPR_PRE_INDEX:
+    case ARM64_INST_LDRB_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRH_GPR_REGISTER_OFFSET:
     case ARM64_INST_LDR_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRB_GPR_UNSIGNED_OFFSET:
+    case ARM64_INST_LDRH_GPR_UNSIGNED_OFFSET:
     case ARM64_INST_LDR_GPR_UNSIGNED_OFFSET:
     {
         __uint128_t raw;
-        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &raw)) return EMU_INST_SKIP;
-        reg_write(regs, decoded->rt, (uint64_t)raw, decoded->operand_width == 64);
-        if (decoded->instruction == ARM64_INST_LDAR || decoded->instruction == ARM64_INST_LDLAR || decoded->instruction == ARM64_INST_LDAPR || decoded->instruction == ARM64_INST_LDAPUR) smp_mb();
+        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &raw)) goto emulate_failed;
+        write_gpr_or_zr(regs, decoded->rt, (uint64_t)raw, decoded->operand_width == 64);
+        switch (decoded->instruction)
+        {
+        case ARM64_INST_LDLARB:
+        case ARM64_INST_LDLARH:
+        case ARM64_INST_LDLAR:
+        case ARM64_INST_LDARB:
+        case ARM64_INST_LDARH:
+        case ARM64_INST_LDAR:
+        case ARM64_INST_LDAPRB:
+        case ARM64_INST_LDAPRH:
+        case ARM64_INST_LDAPR:
+        case ARM64_INST_LDAPURB:
+        case ARM64_INST_LDAPURH:
+        case ARM64_INST_LDAPUR:
+            smp_mb();
+            break;
+        default:
+            break;
+        }
         break;
     }
 
     /* ----- 通用寄存器 (GPR) 有符号扩展加载 ----- */
-    case ARM64_INST_LDAPUR_SIGNED:
+    case ARM64_INST_LDAPURSB:
+    case ARM64_INST_LDAPURSH:
+    case ARM64_INST_LDAPURSW:
     case ARM64_INST_LDRSW_LITERAL:
-    case ARM64_INST_LDUR_SIGNED_GPR:
-    case ARM64_INST_LDTR_SIGNED_GPR:
-    case ARM64_INST_LDR_SIGNED_GPR_POST_INDEX:
-    case ARM64_INST_LDR_SIGNED_GPR_PRE_INDEX:
-    case ARM64_INST_LDR_SIGNED_GPR_REGISTER_OFFSET:
-    case ARM64_INST_LDR_SIGNED_GPR_UNSIGNED_OFFSET:
+    case ARM64_INST_LDURSB_GPR:
+    case ARM64_INST_LDURSH_GPR:
+    case ARM64_INST_LDURSW_GPR:
+    case ARM64_INST_LDTRSB_GPR:
+    case ARM64_INST_LDTRSH_GPR:
+    case ARM64_INST_LDTRSW_GPR:
+    case ARM64_INST_LDRSB_GPR_POST_INDEX:
+    case ARM64_INST_LDRSH_GPR_POST_INDEX:
+    case ARM64_INST_LDRSW_GPR_POST_INDEX:
+    case ARM64_INST_LDRSB_GPR_PRE_INDEX:
+    case ARM64_INST_LDRSH_GPR_PRE_INDEX:
+    case ARM64_INST_LDRSW_GPR_PRE_INDEX:
+    case ARM64_INST_LDRSB_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRSH_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRSW_GPR_REGISTER_OFFSET:
+    case ARM64_INST_LDRSB_GPR_UNSIGNED_OFFSET:
+    case ARM64_INST_LDRSH_GPR_UNSIGNED_OFFSET:
+    case ARM64_INST_LDRSW_GPR_UNSIGNED_OFFSET:
     {
         __uint128_t raw;
-        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &raw)) return EMU_INST_SKIP;
-        reg_write(regs, decoded->rt, sign_extend64((uint64_t)raw, ptebp_instruction_bytes(decoded) * 8 - 1), decoded->operand_width == 64);
-        if (decoded->instruction == ARM64_INST_LDAPUR_SIGNED) smp_mb();
+        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &raw)) goto emulate_failed;
+        write_gpr_or_zr(regs, decoded->rt, sign_extend64((uint64_t)raw, ptebp_instruction_bytes(decoded) * 8 - 1), decoded->operand_width == 64);
+        switch (decoded->instruction)
+        {
+        case ARM64_INST_LDAPURSB:
+        case ARM64_INST_LDAPURSH:
+        case ARM64_INST_LDAPURSW:
+            smp_mb();
+            break;
+        default:
+            break;
+        }
         break;
     }
 
     /* ----- 通用寄存器 (GPR) 单寄存器存储（含 Release） ----- */
+    case ARM64_INST_STLLRB:
+    case ARM64_INST_STLLRH:
     case ARM64_INST_STLLR:
+    case ARM64_INST_STLRB:
+    case ARM64_INST_STLRH:
     case ARM64_INST_STLR:
+    case ARM64_INST_STLURB:
+    case ARM64_INST_STLURH:
     case ARM64_INST_STLUR:
         smp_mb();
         fallthrough;
+    case ARM64_INST_STURB_GPR:
+    case ARM64_INST_STURH_GPR:
     case ARM64_INST_STUR_GPR:
+    case ARM64_INST_STTRB_GPR:
+    case ARM64_INST_STTRH_GPR:
     case ARM64_INST_STTR_GPR:
+    case ARM64_INST_STRB_GPR_POST_INDEX:
+    case ARM64_INST_STRH_GPR_POST_INDEX:
     case ARM64_INST_STR_GPR_POST_INDEX:
+    case ARM64_INST_STRB_GPR_PRE_INDEX:
+    case ARM64_INST_STRH_GPR_PRE_INDEX:
     case ARM64_INST_STR_GPR_PRE_INDEX:
+    case ARM64_INST_STRB_GPR_REGISTER_OFFSET:
+    case ARM64_INST_STRH_GPR_REGISTER_OFFSET:
     case ARM64_INST_STR_GPR_REGISTER_OFFSET:
+    case ARM64_INST_STRB_GPR_UNSIGNED_OFFSET:
+    case ARM64_INST_STRH_GPR_UNSIGNED_OFFSET:
     case ARM64_INST_STR_GPR_UNSIGNED_OFFSET:
-        if (ptebp_emu_write_mem(address, ptebp_instruction_bytes(decoded), reg_read(regs, decoded->rt))) return EMU_INST_SKIP;
+        if (ptebp_emu_write_mem(address, ptebp_instruction_bytes(decoded), read_gpr_or_zr(regs, decoded->rt))) goto emulate_failed;
         break;
 
     /* ----- 通用寄存器 (GPR) 成对加载 ----- */
@@ -569,19 +641,19 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
     case ARM64_INST_LDPSW_PRE_INDEX:
     {
         __uint128_t raw0, raw1;
-        bool is_signed = (decoded->instruction == ARM64_INST_LDPSW_OFFSET || decoded->instruction == ARM64_INST_LDPSW_POST_INDEX || decoded->instruction == ARM64_INST_LDPSW_PRE_INDEX);
+        bool is_signed = decoded->instruction == ARM64_INST_LDPSW_OFFSET || decoded->instruction == ARM64_INST_LDPSW_POST_INDEX || decoded->instruction == ARM64_INST_LDPSW_PRE_INDEX;
 
-        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &raw0) || ptebp_emu_read_mem(address + ptebp_instruction_bytes(decoded), ptebp_instruction_bytes(decoded), &raw1)) return EMU_INST_SKIP;
+        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &raw0) || ptebp_emu_read_mem(address + ptebp_instruction_bytes(decoded), ptebp_instruction_bytes(decoded), &raw1)) goto emulate_failed;
 
         if (is_signed)
         {
-            reg_write(regs, decoded->rt, sign_extend64((uint64_t)raw0, 31), true);
-            reg_write(regs, decoded->rt2, sign_extend64((uint64_t)raw1, 31), true);
+            write_gpr_or_zr(regs, decoded->rt, sign_extend64((uint64_t)raw0, 31), true);
+            write_gpr_or_zr(regs, decoded->rt2, sign_extend64((uint64_t)raw1, 31), true);
         }
         else
         {
-            reg_write(regs, decoded->rt, (uint64_t)raw0, decoded->operand_width == 64);
-            reg_write(regs, decoded->rt2, (uint64_t)raw1, decoded->operand_width == 64);
+            write_gpr_or_zr(regs, decoded->rt, (uint64_t)raw0, decoded->operand_width == 64);
+            write_gpr_or_zr(regs, decoded->rt2, (uint64_t)raw1, decoded->operand_width == 64);
         }
         break;
     }
@@ -596,48 +668,26 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
         uint64_t mask = (ptebp_instruction_bytes(decoded) == sizeof(mask)) ? U64_MAX : (1ULL << (ptebp_instruction_bytes(decoded) * 8)) - 1;
         __uint128_t pair;
 
-        if (total_bytes > sizeof(pair)) return EMU_INST_SKIP;
+        if (total_bytes > sizeof(pair)) goto emulate_failed;
 
-        pair = (__uint128_t)(reg_read(regs, decoded->rt) & mask) | ((__uint128_t)(reg_read(regs, decoded->rt2) & mask) << (ptebp_instruction_bytes(decoded) * 8));
+        pair = (__uint128_t)(read_gpr_or_zr(regs, decoded->rt) & mask) | ((__uint128_t)(read_gpr_or_zr(regs, decoded->rt2) & mask) << (ptebp_instruction_bytes(decoded) * 8));
 
-        if (ptebp_emu_write_mem(address, total_bytes, pair)) return EMU_INST_SKIP;
+        if (ptebp_emu_write_mem(address, total_bytes, pair)) goto emulate_failed;
         break;
     }
 
     /* ----- FP/SIMD 单寄存器加载 ----- */
-    case ARM64_INST_LDRS_LITERAL_FP_SIMD:
-    case ARM64_INST_LDRD_LITERAL_FP_SIMD:
-    case ARM64_INST_LDRQ_LITERAL_FP_SIMD:
-    case ARM64_INST_LDURB_FP_SIMD:
-    case ARM64_INST_LDURH_FP_SIMD:
-    case ARM64_INST_LDURS_FP_SIMD:
-    case ARM64_INST_LDURD_FP_SIMD:
-    case ARM64_INST_LDURQ_FP_SIMD:
-    case ARM64_INST_LDRB_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRH_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRB_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRH_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRQ_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRB_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRH_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRS_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRD_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRQ_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_LDRB_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_LDRH_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_LDRS_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_LDRD_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_LDRQ_FP_SIMD_UNSIGNED_OFFSET:
+    case ARM64_INST_LDR_FP_SIMD_LITERAL:
+    case ARM64_INST_LDUR_FP_SIMD:
+    case ARM64_INST_LDR_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDR_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_LDR_FP_SIMD_REGISTER_OFFSET:
+    case ARM64_INST_LDR_FP_SIMD_UNSIGNED_OFFSET:
     {
         struct fp_regs fp_regs __attribute__((__uninitialized__));
         __uint128_t value;
 
-        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &value)) return EMU_INST_SKIP;
+        if (ptebp_emu_read_mem(address, ptebp_instruction_bytes(decoded), &value)) goto emulate_failed;
 
         read_all_q_regs(&fp_regs);
         fp_regs.q[decoded->rt] = value;
@@ -646,58 +696,30 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
     }
 
     /* ----- FP/SIMD 单寄存器存储 ----- */
-    case ARM64_INST_STURB_FP_SIMD:
-    case ARM64_INST_STURH_FP_SIMD:
-    case ARM64_INST_STURS_FP_SIMD:
-    case ARM64_INST_STURD_FP_SIMD:
-    case ARM64_INST_STURQ_FP_SIMD:
-    case ARM64_INST_STRB_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRH_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRB_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRH_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRQ_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRB_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRH_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRS_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRD_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRQ_FP_SIMD_REGISTER_OFFSET:
-    case ARM64_INST_STRB_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_STRH_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_STRS_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_STRD_FP_SIMD_UNSIGNED_OFFSET:
-    case ARM64_INST_STRQ_FP_SIMD_UNSIGNED_OFFSET:
+    case ARM64_INST_STUR_FP_SIMD:
+    case ARM64_INST_STR_FP_SIMD_POST_INDEX:
+    case ARM64_INST_STR_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_STR_FP_SIMD_REGISTER_OFFSET:
+    case ARM64_INST_STR_FP_SIMD_UNSIGNED_OFFSET:
     {
         struct fp_regs fp_regs __attribute__((__uninitialized__));
 
         read_all_q_regs(&fp_regs);
-        if (ptebp_emu_write_mem(address, ptebp_instruction_bytes(decoded), fp_regs.q[decoded->rt])) return EMU_INST_SKIP;
+        if (ptebp_emu_write_mem(address, ptebp_instruction_bytes(decoded), fp_regs.q[decoded->rt])) goto emulate_failed;
         break;
     }
 
     /* ----- FP/SIMD 成对加载 ----- */
-    case ARM64_INST_LDNPS_FP_SIMD:
-    case ARM64_INST_LDNPD_FP_SIMD:
-    case ARM64_INST_LDNPQ_FP_SIMD:
-    case ARM64_INST_LDPS_FP_SIMD_OFFSET:
-    case ARM64_INST_LDPD_FP_SIMD_OFFSET:
-    case ARM64_INST_LDPQ_FP_SIMD_OFFSET:
-    case ARM64_INST_LDPS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDPD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDPQ_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_LDNP_FP_SIMD:
+    case ARM64_INST_LDP_FP_SIMD_OFFSET:
+    case ARM64_INST_LDP_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDP_FP_SIMD_PRE_INDEX:
     {
         struct fp_regs fp_regs __attribute__((__uninitialized__));
         __uint128_t value0, value1;
         uint8_t bytes = ptebp_instruction_bytes(decoded);
 
-        if (ptebp_emu_read_mem(address, bytes, &value0) || ptebp_emu_read_mem(address + bytes, bytes, &value1)) return EMU_INST_SKIP;
+        if (ptebp_emu_read_mem(address, bytes, &value0) || ptebp_emu_read_mem(address + bytes, bytes, &value1)) goto emulate_failed;
 
         read_all_q_regs(&fp_regs);
         fp_regs.q[decoded->rt] = value0;
@@ -707,86 +729,66 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
     }
 
     /* ----- FP/SIMD 成对存储 ----- */
-    case ARM64_INST_STNPS_FP_SIMD:
-    case ARM64_INST_STNPD_FP_SIMD:
-    case ARM64_INST_STNPQ_FP_SIMD:
-    case ARM64_INST_STPS_FP_SIMD_OFFSET:
-    case ARM64_INST_STPD_FP_SIMD_OFFSET:
-    case ARM64_INST_STPQ_FP_SIMD_OFFSET:
-    case ARM64_INST_STPS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STPD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STPQ_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_STNP_FP_SIMD:
+    case ARM64_INST_STP_FP_SIMD_OFFSET:
+    case ARM64_INST_STP_FP_SIMD_POST_INDEX:
+    case ARM64_INST_STP_FP_SIMD_PRE_INDEX:
     {
         struct fp_regs fp_regs __attribute__((__uninitialized__));
         uint8_t bytes = ptebp_instruction_bytes(decoded);
         size_t total_bytes = bytes * 2;
         __uint128_t mask, pair;
 
-        if (total_bytes > sizeof(pair)) return EMU_INST_SKIP;
+        if (total_bytes > sizeof(pair)) goto emulate_failed;
 
         read_all_q_regs(&fp_regs);
         mask = (bytes == 16) ? ~(__uint128_t)0 : (((__uint128_t)1 << (bytes * 8)) - 1);
         pair = (fp_regs.q[decoded->rt] & mask) | ((fp_regs.q[decoded->rt2] & mask) << (bytes * 8));
 
-        if (ptebp_emu_write_mem(address, total_bytes, pair)) return EMU_INST_SKIP;
+        if (ptebp_emu_write_mem(address, total_bytes, pair)) goto emulate_failed;
         break;
     }
 
     default:
-        return EMU_INST_SKIP;
+        goto emulate_failed;
     }
 
     // 所有成功的指令统一在此提交 pre/post-index 基址写回并推进 PC
     switch (decoded->instruction)
     {
+    case ARM64_INST_STRB_GPR_POST_INDEX:
+    case ARM64_INST_STRH_GPR_POST_INDEX:
     case ARM64_INST_STR_GPR_POST_INDEX:
+    case ARM64_INST_LDRB_GPR_POST_INDEX:
+    case ARM64_INST_LDRH_GPR_POST_INDEX:
     case ARM64_INST_LDR_GPR_POST_INDEX:
-    case ARM64_INST_LDR_SIGNED_GPR_POST_INDEX:
-    case ARM64_INST_STRB_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRH_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STRQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRB_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRH_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDRQ_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDRSB_GPR_POST_INDEX:
+    case ARM64_INST_LDRSH_GPR_POST_INDEX:
+    case ARM64_INST_LDRSW_GPR_POST_INDEX:
+    case ARM64_INST_STR_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDR_FP_SIMD_POST_INDEX:
     case ARM64_INST_STP_GPR_POST_INDEX:
     case ARM64_INST_LDP_GPR_POST_INDEX:
-    case ARM64_INST_STPS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_STPQ_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPS_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPD_FP_SIMD_POST_INDEX:
-    case ARM64_INST_LDPQ_FP_SIMD_POST_INDEX:
+    case ARM64_INST_STP_FP_SIMD_POST_INDEX:
+    case ARM64_INST_LDP_FP_SIMD_POST_INDEX:
     case ARM64_INST_LDPSW_POST_INDEX:
+    case ARM64_INST_STRB_GPR_PRE_INDEX:
+    case ARM64_INST_STRH_GPR_PRE_INDEX:
     case ARM64_INST_STR_GPR_PRE_INDEX:
+    case ARM64_INST_LDRB_GPR_PRE_INDEX:
+    case ARM64_INST_LDRH_GPR_PRE_INDEX:
     case ARM64_INST_LDR_GPR_PRE_INDEX:
-    case ARM64_INST_LDR_SIGNED_GPR_PRE_INDEX:
-    case ARM64_INST_STRB_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRH_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STRQ_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRB_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRH_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDRQ_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_LDRSB_GPR_PRE_INDEX:
+    case ARM64_INST_LDRSH_GPR_PRE_INDEX:
+    case ARM64_INST_LDRSW_GPR_PRE_INDEX:
+    case ARM64_INST_STR_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_LDR_FP_SIMD_PRE_INDEX:
     case ARM64_INST_STP_GPR_PRE_INDEX:
     case ARM64_INST_LDP_GPR_PRE_INDEX:
-    case ARM64_INST_STPS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STPD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_STPQ_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDPS_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDPD_FP_SIMD_PRE_INDEX:
-    case ARM64_INST_LDPQ_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_STP_FP_SIMD_PRE_INDEX:
+    case ARM64_INST_LDP_FP_SIMD_PRE_INDEX:
     case ARM64_INST_LDPSW_PRE_INDEX:
-        addr_reg_write(regs, decoded->rn, base + decoded->offset);
+        write_gpr_or_sp(regs, decoded->rn, base + decoded->offset);
         break;
     default:
         break;
@@ -794,8 +796,12 @@ static enum emu_inst_result ptebp_emulate_load_store(struct pt_regs *regs, uint3
 
     regs->pc = pc + 4;
     return EMU_INST_HANDLED;
+
+emulate_failed:
+    ls_log_always_tag("ptebp", "emulate skip pc=0x%llx inst=0x%08x\n", (unsigned long long)pc, raw_inst);
+    return EMU_INST_SKIP;
 }
-//撤销整组 BRK/PTE 监控。
+//撤销整组 UDF/PTE 监控。
 static void ptebp_drop_all_monitors(bool lock_mm)
 {
     struct mm_struct *mm;
@@ -817,7 +823,7 @@ static void ptebp_drop_all_monitors(bool lock_mm)
         spin_lock_irqsave(&g_ptebp_lock, flags);
     }
 
-    // 阶段一：先恢复所有断点的原始指令（确保页面恢复访问前不再含 BRK）
+    // 阶段一：先恢复所有断点的原始指令（确保页面恢复访问前不再含 UDF）
     for (size_t i = 0; i < ARRAY_SIZE(g_ptebp_slots); i++)
     {
         struct ptebp_slot *s = &g_ptebp_slots[i];
@@ -930,53 +936,51 @@ out_not_ours:
     spin_unlock_irqrestore(&g_ptebp_lock, flags);
     return 0;
 }
-/* ======================== BRK 命中处理 ======================== */
+/* ======================== UDF 命中处理 ======================== */
 
-//brk_handler 的 hook 工作函数，只接管当前目标 mm 中由本实现写入的 BRK 地址。
-static int ptebp_handle_brk(struct pt_regs *hook_regs)
+// EL0 同步异常入口的 hook 工作函数，只接管当前目标 mm 中由本实现写入的 UDF #0 地址。
+static int ptebp_handle_undef_sync(struct pt_regs *hook_regs)
 {
     struct fp_regs fp_regs __attribute__((__uninitialized__));
     struct bp_point *hit_point = NULL;
     struct pt_regs *regs;
     uint32_t emulate_inst_word;
     uint64_t pc;
-    size_t point_slot;
     unsigned long flags;
+    bool stopping;
 
     if (!hook_regs) return 0;
 
-    //  快速前置过滤
-    regs = (struct pt_regs *)hook_regs->regs[2];
+    // UDF #0 进入 Unknown/Uncategorized；其他同步异常交给原生分发器。
+    if (ESR_ELx_EC(read_sysreg(esr_el1)) != ESR_ELx_EC_UNKNOWN) return 0;
+
+    // 两代同步入口都在 x0 传入真实用户 pt_regs。
+    regs = (struct pt_regs *)(uintptr_t)hook_regs->regs[0];
     if (!regs || !current->mm || !user_mode(regs) || (current->flags & PF_EXITING)) return 0;
 
-    if (!ptebp_marker_slot_from_comment(hook_regs->regs[1] & ESR_ELx_BRK64_ISS_COMMENT_MASK, &point_slot)) return 0;
+    pc = untagged_addr(regs->pc);
 
-    pc = untagged_addr(regs->pc) & ~0x3ULL;
-
-    //  锁内校验目标 mm 与 PC，提取断点信息
+    // 锁内校验目标 mm 与 PC，提取断点信息。
     spin_lock_irqsave(&g_ptebp_lock, flags);
     if (!ptebp_monitor_active_locked(current->mm))
     {
         spin_unlock_irqrestore(&g_ptebp_lock, flags);
-        return 0; // 非当前受管实例，交由原生处理
+        return 0;
     }
 
-    if (g_ptebp_stopping)
+    for (size_t point_slot = 0; point_slot < ARRAY_SIZE(g_ptebp_slots); point_slot++)
     {
-        spin_unlock_irqrestore(&g_ptebp_lock, flags);
-        goto brk_handled;
-    }
-
-    if (g_ptebp_slots[point_slot].hook_addr == pc)
-    {
+        if (g_ptebp_slots[point_slot].hook_addr != pc) continue;
         hit_point = &g_ptebp_info->points[point_slot];
         emulate_inst_word = g_ptebp_slots[point_slot].orig_inst;
+        break;
     }
+    stopping = g_ptebp_stopping;
     spin_unlock_irqrestore(&g_ptebp_lock, flags);
 
     if (!hit_point) return 0;
+    if (stopping) return 1;
 
-    // 执行命中回调与单步模拟（共享一套 FP/SIMD 现场）
     read_all_q_regs(&fp_regs);
     if (hit_point->on_hit) hit_point->on_hit(regs, &fp_regs, hit_point);
 
@@ -984,263 +988,235 @@ static int ptebp_handle_brk(struct pt_regs *hook_regs)
     if (regs->pc == pc && !emulate_inst(regs, &fp_regs, emulate_inst_word)) ptebp_drop_all_monitors(false);
 
     write_all_q_regs(&fp_regs);
-
-brk_handled:
-    hook_regs->regs[0] = 0;
     return 1;
 }
 
-/* ======================== syscall 输出逻辑视图 ======================== */
-
-/*
-13 种测试读取路径按数据真正经过的位置统一处理：
-1. /proc/self/exe pread、process_vm_readv libc/direct、/proc/self/mem pread libc/direct、
-    /proc/self/mem lseek+read：syscall 完整执行后，只扫描实际成功返回的输出缓冲区；
-    遇到 BRK #0xA500+slot marker 就直接用该槽位 orig_inst 覆盖，返回值不变。
-2. /proc/self/exe mmap：原生读取未修改的文件映射，作为磁盘基准，这里不接管。
-3. memcpy、memmove、volatile u8/u32、AArch64 LDP：直接访问 guard 页，由 EL0 DABT 返回逻辑原指令。
-4. pipe write/copy_from_user direct：内核读取用户页时由 EL1 DABT 返回逻辑原指令。
-
-所有写入完全保持原生语义，不检查输入和目标，也不更新 orig_inst 或重新安装 marker；
-写入覆盖 marker 后该断点自然失效，需要时由调用方卸载并重新安装监控。
-*/
-
-#define PTEBP_SYSCALL_MAX_IOV 1024UL
-
-// do_el0_svc 返回跳板使用 inline hook 预留的 32 字节 metadata，不改变原 syscall 返回值。
-struct ptebp_syscall_return_frame
+// 覆盖当前 PTEBP data guard 时只更新 VMA；
+static int ptebp_handle_mprotect(struct pt_regs *hook_regs)
 {
-    unsigned long return_addr;
-    struct pt_regs *regs;
-    void (*handler)(struct ptebp_syscall_return_frame *frame);
-};
-
-struct ptebp_patch_snapshot
-{
-    uint32_t marker_inst;
-    uint32_t orig_inst;
-};
-
-struct ptebp_read_scanner
-{
-    struct ptebp_patch_snapshot snapshots[BP_CONFIG_MAX];
-    void __user *carry_addr[sizeof(uint32_t) - 1];
-    uint8_t carry[sizeof(uint32_t) - 1];
-    size_t carry_size;
-};
-
-static bool ptebp_init_read_scanner(struct ptebp_read_scanner *scanner)
-{
+    static int (*fn_split_vma)(struct mm_struct *, struct vm_area_struct *, unsigned long, int) = NULL;
+    static void (*fn_vma_set_page_prot)(struct vm_area_struct *) = NULL;
+    struct pt_regs *sys_regs;
+    struct vm_area_struct *vma;
+    unsigned long start, len, end, prot, cursor;
     unsigned long flags;
+    int status = 0;
+    bool is_covered = false;
 
-    memset(scanner, 0, sizeof(*scanner));
+    if (!hook_regs || !current->mm || (current->flags & PF_EXITING)) return 0;
 
+    // __arm64_sys_mprotect 是全局 hook；先用当前进程 mm 做快速过滤，非目标进程立即放行。
     spin_lock_irqsave(&g_ptebp_lock, flags);
-    if (!ptebp_monitor_active_locked(current->mm)) goto out_unlock;
-    for (size_t slot_index = 0; slot_index < ARRAY_SIZE(g_ptebp_slots); slot_index++)
-    {
-        const struct ptebp_slot *slot = &g_ptebp_slots[slot_index];
-
-        if (!slot->hook_addr) continue;
-        scanner->snapshots[slot_index] = (struct ptebp_patch_snapshot){.marker_inst = slot->marker_inst, .orig_inst = slot->orig_inst};
-    }
-    spin_unlock_irqrestore(&g_ptebp_lock, flags);
-    return true;
-out_unlock:
-    spin_unlock_irqrestore(&g_ptebp_lock, flags);
-    return false;
-}
-
-/*
-扫描 syscall 已成功写入的用户输出片段，把专用 BRK marker 直接替换为对应槽位的 orig_inst。
-scanner 保留逻辑流末尾 3 字节及其用户地址，因此 marker 即使未对齐、跨内部扫描块或跨 iovec
-也能识别和原位替换；marker immediate 直接编码槽位号，不需要来源虚拟地址或文件偏移。
-*/
-static void ptebp_scan_read_chunk(struct ptebp_read_scanner *scanner, void __user *destination, size_t size)
-{
-    uint8_t scan_buffer[259];
-    size_t consumed = 0;
-
-    if (!destination || !size) return;
-
-    while (consumed < size)
-    {
-        size_t chunk_size = min_t(size_t, 256, size - consumed);
-        size_t old_carry_size = scanner->carry_size;
-        size_t available = old_carry_size + chunk_size;
-        size_t offset = 0;
-
-        __builtin_memcpy(scan_buffer, scanner->carry, old_carry_size);
-        if (copy_from_user_inatomic_nofault(scan_buffer + old_carry_size, (uint8_t __user *)destination + consumed, chunk_size)) return;
-        while (offset + sizeof(uint32_t) <= available)
-        {
-            uint32_t inst;
-            size_t slot_index;
-
-            __builtin_memcpy(&inst, scan_buffer + offset, sizeof(inst));
-            if (ptebp_marker_slot_from_inst(inst, &slot_index) && scanner->snapshots[slot_index].marker_inst == inst)
-            {
-                for (size_t byte_index = 0; byte_index < sizeof(uint32_t); byte_index++)
-                {
-                    size_t stream_index = offset + byte_index;
-                    void __user *target = stream_index < old_carry_size ? scanner->carry_addr[stream_index] : (uint8_t __user *)destination + consumed + stream_index - old_carry_size;
-
-                    (void)copy_to_user_inatomic_nofault(target, (uint8_t *)&scanner->snapshots[slot_index].orig_inst + byte_index, 1);
-                }
-                __builtin_memcpy(scan_buffer + offset, &scanner->snapshots[slot_index].orig_inst, sizeof(uint32_t));
-                offset += sizeof(uint32_t);
-            }
-            else offset++;
-        }
-
-        scanner->carry_size = min_t(size_t, sizeof(uint32_t) - 1, available);
-        for (size_t carry_index = 0; carry_index < scanner->carry_size; carry_index++)
-        {
-            size_t stream_index = available - scanner->carry_size + carry_index;
-
-            scanner->carry[carry_index] = scan_buffer[stream_index];
-            scanner->carry_addr[carry_index] = stream_index < old_carry_size ? scanner->carry_addr[stream_index] : (uint8_t __user *)destination + consumed + stream_index - old_carry_size;
-        }
-        consumed += chunk_size;
-    }
-}
-
-// read/pread64 返回后，按 x0 的实际成功字节数扫描 x1 指向的用户输出缓冲区。
-static void ptebp_return_read(struct ptebp_syscall_return_frame *frame)
-{
-    struct ptebp_read_scanner scanner;
-    long result = (long)frame->regs->regs[0];
-
-    if (result < (long)sizeof(uint32_t) || !ptebp_init_read_scanner(&scanner)) return;
-    ptebp_scan_read_chunk(&scanner, (void __user *)(uintptr_t)frame->regs->regs[1], (size_t)result);
-}
-
-// process_vm_readv 返回后，复核 orig_x0 中的目标 PID，并按 x0 的成功字节数依次扫描 x1/x2 指定的 local iovec。
-static void ptebp_return_process_vm_readv(struct ptebp_syscall_return_frame *frame)
-{
-    struct pt_regs *regs = frame->regs;
-    const struct iovec __user *local_iov = (const struct iovec __user *)(uintptr_t)regs->regs[1];
-    unsigned long local_count = regs->regs[2];
-    struct ptebp_read_scanner scanner;
-    struct iovec local = {0};
-    size_t local_offset = 0;
-    unsigned long local_index = 0;
-    long result = (long)regs->regs[0];
-
-    if (result <= 0 || (pid_t)regs->orig_x0 != current->tgid || !local_iov || !local_count || local_count > PTEBP_SYSCALL_MAX_IOV || !ptebp_init_read_scanner(&scanner)) return;
-    size_t completed = (size_t)result;
-    while (completed)
-    {
-        while (local_offset == local.iov_len)
-        {
-            if (local_index >= local_count || copy_from_user_inatomic_nofault(&local, &local_iov[local_index++], sizeof(local))) return;
-            local_offset = 0;
-        }
-
-        size_t chunk = min_t(size_t, completed, local.iov_len - local_offset);
-        void __user *local_addr = (uint8_t __user *)local.iov_base + local_offset;
-
-        ptebp_scan_read_chunk(&scanner, local_addr, chunk);
-        completed -= chunk;
-        local_offset += chunk;
-    }
-}
-
-static void __attribute__((used, __noinline__)) ptebp_handle_syscall_return(struct ptebp_syscall_return_frame *frame)
-{
-    frame->handler(frame);
-
-    if (atomic_dec_and_test(&g_ptebp_syscall_returns_inflight)) wake_up_all(&g_ptebp_syscall_return_wait);
-}
-
-__attribute__((naked, used)) void ret_trampoline_ptebp_syscall(void)
-{
-    asm volatile("mov x0, sp\n"
-                 "bl ptebp_handle_syscall_return\n"
-                 "ldp x16, xzr, [sp], #304\n"
-                 "ret x16\n");
-}
-
-// do_el0_svc 入口只改写内核函数返回 LR；原 syscall 完整执行，输出修补发生在返回跳板。
-static int ptebp_syscall_entry_hook(struct pt_regs *hook_regs)
-{
-    struct ptebp_syscall_return_frame *frame;
-    struct pt_regs *regs;
-    unsigned long flags;
-    long syscallno;
-
-    // 返回帧必须能容纳在 inline hook 为当前调用预留的 metadata 区域中。
-    BUILD_BUG_ON(sizeof(struct ptebp_syscall_return_frame) > HOOK_METADATA_BYTES);
-    // do_el0_svc 的 hook 参数是合成的 hook 帧；其 x0 保存真实 syscall 的 pt_regs 地址。
-    regs = (struct pt_regs *)(uintptr_t)hook_regs->regs[0];
-    frame = hook_frame_metadata(hook_regs);
-
-    // AArch64 syscall 号位于 x8，只接管会把用户输出写回内存的读取类 syscall。
-    syscallno = (long)regs->regs[8];
-    switch (syscallno)
-    {
-    case __NR_read:
-        frame->handler = ptebp_return_read;
-        break;
-    case __NR_pread64:
-        frame->handler = ptebp_return_read;
-        break;
-    case __NR_process_vm_readv:
-        // 只修补当前进程读回自己的结果，避免影响跨进程读取语义。
-        if ((pid_t)regs->regs[0] != current->tgid) return 0;
-        frame->handler = ptebp_return_process_vm_readv;
-        break;
-    default:
-        return 0;
-    }
-
-    // stopping 置位后禁止新增返回回调；登记 inflight 后再放锁，确保 stop 等待期间不会漏计数。
-    spin_lock_irqsave(&g_ptebp_lock, flags);
-    if (!ptebp_monitor_active_locked(current->mm) || g_ptebp_stopping)
+    if (!g_ptebp_info || g_ptebp_mm != current->mm || g_ptebp_stopping)
     {
         spin_unlock_irqrestore(&g_ptebp_lock, flags);
         return 0;
     }
-    atomic_inc(&g_ptebp_syscall_returns_inflight);
     spin_unlock_irqrestore(&g_ptebp_lock, flags);
 
-    // 保存原返回地址和真实 syscall 上下文，供 syscall 完成后选择对应的输出修补逻辑。
-    frame->return_addr = hook_regs->regs[30];
-    frame->regs = regs;
+    sys_regs = (struct pt_regs *)(uintptr_t)hook_regs->regs[0];
+    if (!sys_regs || !user_mode(sys_regs)) return 0;
 
-    //把 inline hook 框架的 304 字节临时栈帧延长到整个 syscall 执行结束。
-    hook_regs->sp = (unsigned long)frame;
-    //替换 do_el0_svc() 的返回地址
-    hook_regs->regs[30] = (unsigned long)ret_trampoline_ptebp_syscall;
-    return 0;
+    /* 1. 参数对齐与合法性校验 */
+    start = untagged_addr(sys_regs->regs[0]);
+    if (!IS_ALIGNED(start, PAGE_SIZE) || !sys_regs->regs[1]) return 0;
+
+    len = PAGE_ALIGN(sys_regs->regs[1]);
+    if (!len || (start + len < start)) return 0; // 溢出检查
+    end = start + len;
+    prot = sys_regs->regs[2];
+
+    /* 2. 检查 mprotect 范围是否触及监管页 (未命中则直接放行交由原系统调用处理) */
+    spin_lock_irqsave(&g_ptebp_lock, flags);
+    if (g_ptebp_info && g_ptebp_mm == current->mm && !g_ptebp_stopping)
+    {
+        for (size_t i = 0; i < ARRAY_SIZE(g_ptebp_slots); i++)
+        {
+            unsigned long page = g_ptebp_slots[i].page_vaddr;
+            if (g_ptebp_slots[i].hook_addr && page >= start && page < end)
+            {
+                is_covered = true;
+                break;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&g_ptebp_lock, flags);
+    if (!is_covered) return 0;
+
+    /* 3. 获取非导出内核函数地址与 mm 锁 */
+    if (!fn_split_vma)
+    {
+        fn_split_vma = (void *)generic_kallsyms_lookup_name("split_vma");
+        if (!fn_split_vma)
+        {
+            hook_regs->regs[0] = -ENOSYS;
+            return 1;
+        }
+    }
+
+    if (!fn_vma_set_page_prot)
+    {
+        fn_vma_set_page_prot = (void *)generic_kallsyms_lookup_name("vma_set_page_prot");
+        if (!fn_vma_set_page_prot)
+        {
+            hook_regs->regs[0] = -ENOSYS;
+            return 1;
+        }
+    }
+
+    if (mmap_write_lock_killable(current->mm))
+    {
+        hook_regs->regs[0] = -EINTR;
+        return 1;
+    }
+
+    // hook 安装在全局 syscall 符号上；拿到 mmap 锁后再次确认目标 mm，避免停止或换目标期间误接管其他进程。
+    spin_lock_irqsave(&g_ptebp_lock, flags);
+    if (!g_ptebp_info || g_ptebp_mm != current->mm || g_ptebp_stopping)
+    {
+        spin_unlock_irqrestore(&g_ptebp_lock, flags);
+        mmap_write_unlock(current->mm);
+        return 0;
+    }
+    spin_unlock_irqrestore(&g_ptebp_lock, flags);
+
+    /* 4. 核心循环：拆分 VMA、更新 VMA 权限，并按需更新 PTE */
+    cursor = start;
+    while (cursor < end)
+    {
+        unsigned long seg_end, newflags;
+        unsigned long eff_prot = prot;
+
+        vma = find_vma(current->mm, cursor);
+        if (!vma || vma->vm_start > cursor)
+        {
+            status = -ENOMEM;
+            break;
+        }
+
+        // 起点不在 VMA 开头，向前拆分
+        if (cursor != vma->vm_start)
+        {
+            if (fn_split_vma(current->mm, vma, cursor, 1))
+            {
+                status = -ENOMEM;
+                break;
+            }
+            vma = find_vma(current->mm, cursor);
+            if (!vma || vma->vm_start != cursor)
+            {
+                status = -ENOMEM;
+                break;
+            }
+        }
+
+        // 终点不在 VMA 末尾，向后拆分
+        seg_end = min_t(unsigned long, vma->vm_end, end);
+        if (seg_end != vma->vm_end)
+        {
+            if (fn_split_vma(current->mm, vma, seg_end, 0))
+            {
+                status = -ENOMEM;
+                break;
+            }
+        }
+
+        // 计算并写入 VMA 新标志位
+        if ((current->personality & READ_IMPLIES_EXEC) && (eff_prot & PROT_READ) && (vma->vm_flags & VM_MAYEXEC)) eff_prot |= PROT_EXEC;
+
+        newflags = calc_vm_prot_bits(eff_prot, -1) | (vma->vm_flags & ~(VM_READ | VM_WRITE | VM_EXEC | VM_FLAGS_CLEAR));
+        if ((newflags & ~(newflags >> 4)) & VM_ACCESS_FLAGS)
+        {
+            status = -EACCES;
+            break;
+        }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+        vm_flags_reset(vma, newflags);
+#else
+        WRITE_ONCE(vma->vm_flags, newflags);
+#endif
+        fn_vma_set_page_prot(vma);
+
+        // 逐页检查：普通页修改 PTE，受监管的页跳过 PTE 修改
+        for (unsigned long page = cursor; page < seg_end; page += PAGE_SIZE)
+        {
+            bool is_guarded = false;
+
+            spin_lock_irqsave(&g_ptebp_lock, flags);
+            for (size_t i = 0; i < ARRAY_SIZE(g_ptebp_slots); i++)
+            {
+                if (g_ptebp_slots[i].hook_addr && g_ptebp_slots[i].page_vaddr == page)
+                {
+                    is_guarded = true;
+                    break;
+                }
+            }
+            spin_unlock_irqrestore(&g_ptebp_lock, flags);
+
+            // 遇到监管页直接跳过，保持当前的 Guard PTE 不变
+            if (is_guarded) continue;
+
+            // 普通页：正常更新 PTE 权限
+            pte_t *ptep = get_user_pte(current->mm, page);
+            if (ptep)
+            {
+                pte_t old_pte = READ_ONCE(*ptep);
+                if (pte_present(old_pte))
+                {
+                    set_pte(ptep, pte_modify(old_pte, vma->vm_page_prot));
+                    flush_tlb_addr_all_asid_all_cpus(page);
+                }
+            }
+        }
+
+        cursor = seg_end;
+    }
+
+    mmap_write_unlock(current->mm);
+    hook_regs->regs[0] = status;
+    return 1; // 无需再执行原系统调用
 }
 
-// 统一接管数据权限异常、原地址 BRK 命中和 syscall 返回输出。
-static struct hook_entry g_ptebp_hooks[] = {
-    HOOK_ENTRY("do_mem_abort", ptebp_handle_data_abort),
-    HOOK_ENTRY("brk_handler", ptebp_handle_brk),
-    HOOK_ENTRY("do_el0_svc", ptebp_syscall_entry_hook),
+// 统一接管数据权限异常、原地址 UDF 命中和 mprotect。
+static struct hook_entry g_ptebp_hooks[][1] = {
+    {HOOK_ENTRY("do_mem_abort", ptebp_handle_data_abort)},
+    {HOOK_ENTRY("el0t_64_sync_handler", ptebp_handle_undef_sync)},
+    {HOOK_ENTRY("el0_sync_handler", ptebp_handle_undef_sync)},
+    {HOOK_ENTRY("__arm64_sys_mprotect", ptebp_handle_mprotect)},
 };
+
+static inline int ptebp_install_hooks(void)
+{
+    int status;
+
+    status = inline_hook_install(g_ptebp_hooks[0]);
+    if (status) return status;
+
+    status = inline_hook_install(g_ptebp_hooks[1]);
+    if (status) status = inline_hook_install(g_ptebp_hooks[2]);
+    if (status) goto err_remove_hooks;
+
+    status = inline_hook_install(g_ptebp_hooks[3]);
+    if (!status) return 0;
+
+err_remove_hooks:
+    for (int hook_index = ARRAY_SIZE(g_ptebp_hooks) - 1; hook_index >= 0; hook_index--) inline_hook_remove(g_ptebp_hooks[hook_index]);
+    return status;
+}
 
 /* ======================== 监控停止与安装 ======================== */
 
-// 停止监控时先禁止新的 syscall 返回登记，排空旧返回并恢复代码/PTE，再移除整组 hook。
+// 停止监控时恢复代码/PTE，再移除整组 hook。
 static inline void stop_ptebp_monitor(void)
 {
-    unsigned long flags;
-    //禁止登记新的 syscall 返回处理
-    spin_lock_irqsave(&g_ptebp_lock, flags);
-    if (g_ptebp_mm && !g_ptebp_stopping) g_ptebp_stopping = true;
-    spin_unlock_irqrestore(&g_ptebp_lock, flags);
-    //等待已经登记的 syscall 返回处理结束
-    wait_event(g_ptebp_syscall_return_wait, atomic_read(&g_ptebp_syscall_returns_inflight) == 0);
     //恢复所有原始指令和原始 PTE
     ptebp_drop_all_monitors(true);
     //移除异常处理 hook
-    inline_hook_remove(g_ptebp_hooks);
+    for (int hook_index = ARRAY_SIZE(g_ptebp_hooks) - 1; hook_index >= 0; hook_index--) inline_hook_remove(g_ptebp_hooks[hook_index]);
 }
 
-//安装一个原地址 BRK 槽位：任一步失败都会尽力恢复当前槽位的原始指令并清空软件状态。
+//安装一个原地址 UDF 槽位：任一步失败都会尽力恢复当前槽位的原始指令并清空软件状态。
 static int ptebp_install_slot(struct break_point *info, size_t point_slot)
 {
     struct ptebp_slot *slot = &g_ptebp_slots[point_slot];
@@ -1250,9 +1226,7 @@ static int ptebp_install_slot(struct break_point *info, size_t point_slot)
     uint32_t marker_inst;
     pteval_t orig_value;
     int status;
-
-    status = arm64_encode_brk(PTEBP_BRK_MARKER_BASE + point_slot, &marker_inst);
-    if (status) return status;
+    marker_inst = PTEBP_UDF_INST;
 
     //去除MTE/TBI 顶字节标签，并地址对齐到4字节边界
     hook_addr = untagged_addr(info->points[point_slot].hit_addr) & ~0x3ULL;
@@ -1288,7 +1262,7 @@ static int ptebp_install_slot(struct break_point *info, size_t point_slot)
         //因此不能复用已有槽位的 orig_pte，需要从目标进程页表中读取这个页面当前的 PTE。
         status = read_user_pte_value(g_ptebp_mm, page_vaddr, &orig_value);
         if (status) return status;
-        //这个原本的pte如果设置了UXN禁止执行,由于brk需要执行权限就说明不合适安装该断点
+        //这个原本的pte如果设置了UXN禁止执行,由于UDF需要执行权限就说明不合适安装该断点
         if (orig_value & PTE_UXN) return -EACCES;
     }
     //初始化当前断点槽位的部分软件状态
@@ -1297,22 +1271,21 @@ static int ptebp_install_slot(struct break_point *info, size_t point_slot)
         .orig_pte = page_owner ? page_owner->orig_pte : __pte(orig_value),
         .hook_addr = hook_addr,
         .page_vaddr = page_vaddr,
-        .marker_inst = marker_inst,
     };
 
     //初始化当前断点槽位的原始指令状态
     status = ptebp_access_inst(slot, &slot->orig_inst, false);
     if (status) goto clear_slot;
 
-    //刚刚读取到的“原始指令”，是否已经是 PTEBP 自己保留的 BRK marker。
-    if (ptebp_marker_slot_from_inst(slot->orig_inst, NULL))
+    // 原始指令已经是 UDF #0 时无法区分本模块 marker 与目标程序自身非法指令，因此拒绝安装。
+    if (slot->orig_inst == PTEBP_UDF_INST)
     {
         status = -ESTALE;
         goto clear_slot;
     }
 
-    // 同页只有第一个槽位需要修改 PTE，其余槽位只增加 BRK 补丁。
-    status = ptebp_access_inst(slot, &slot->marker_inst, true);
+    // 同页只有第一个槽位需要修改 PTE，其余槽位只增加 UDF 补丁。
+    status = ptebp_access_inst(slot, &marker_inst, true);
     if (status) goto clear_slot;
 
     //如果当前断点是该页面上的第一个断点，就把这个页面的原始 PTE 修改为 guard PTE。
@@ -1331,7 +1304,7 @@ clear_slot:
     return status;
 }
 
-// 校验配置、安装异常 hook，并为目标进程的全部执行断点安装 BRK/PTE 状态。
+// 校验配置、安装异常 hook，并为目标进程的全部执行断点安装 UDF/PTE 状态。
 static int start_ptebp_monitor(struct break_point *info)
 {
     struct mm_struct *mm;
@@ -1345,14 +1318,14 @@ static int start_ptebp_monitor(struct break_point *info)
     stop_ptebp_monitor();
 
     //  安装底层 hook
-    status = inline_hook_install(g_ptebp_hooks);
+    status = ptebp_install_hooks();
     if (status) return status;
 
     // 获取目标进程 mm
     mm = get_mm_by_pid(info->tgid);
     if (!mm)
     {
-        inline_hook_remove(g_ptebp_hooks);
+        for (int hook_index = ARRAY_SIZE(g_ptebp_hooks) - 1; hook_index >= 0; hook_index--) inline_hook_remove(g_ptebp_hooks[hook_index]);
         return -EINVAL;
     }
 
