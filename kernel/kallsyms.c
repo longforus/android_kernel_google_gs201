@@ -26,6 +26,7 @@
 #include <linux/ftrace.h>
 #include <linux/kprobes.h>
 #include <linux/compiler.h>
+#include <linux/string.h>
 
 /*
  * These will be re-linked against their real values
@@ -682,6 +683,29 @@ static int s_show(struct seq_file *m, void *p)
 	if (!iter->name[0])
 		return 0;
 
+#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+	/* 编译器生成的前后缀及模块符号也可能包含 KSU/SUSFS 名称。 */
+	if (strstr(iter->name, "ksu_") ||
+	    strstr(iter->name, "susfs") ||
+	    strstr(iter->name, "kernelsu") ||
+	    strstr(iter->name, "sukisu") ||
+	    strstr(iter->name, "ksud") ||
+	    strstr(iter->module_name, "kernelsu") ||
+	    strstr(iter->module_name, "sukisu") ||
+	    strstr(iter->module_name, "susfs") ||
+	    susfs_starts_with(iter->name, "is_manager_") ||
+	    susfs_starts_with(iter->name, "escape_to_") ||
+	    susfs_starts_with(iter->name, "setup_selinux") ||
+	    susfs_starts_with(iter->name, "track_throne") ||
+	    susfs_starts_with(iter->name, "on_post_fs_data") ||
+	    susfs_starts_with(iter->name, "try_umount") ||
+	    susfs_starts_with(iter->name, "handle_sepolicy") ||
+	    susfs_starts_with(iter->name, "getenforce") ||
+	    susfs_starts_with(iter->name, "setenforce") ||
+	    susfs_starts_with(iter->name, "is_zygote"))
+		return 0;
+#endif
+
 	value = iter->show_value ? (void *)iter->value : NULL;
 
 	if (iter->module_name[0]) {
@@ -696,36 +720,8 @@ static int s_show(struct seq_file *m, void *p)
 		seq_printf(m, "%px %c %s\t[%s]\n", value,
 			   type, iter->name, iter->module_name);
 	} else
-#ifndef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
 		seq_printf(m, "%px %c %s\n", value,
 			   iter->type, iter->name);
-#else
-	{
-		if (susfs_starts_with(iter->name, "ksu_") ||
-			susfs_starts_with(iter->name, "__ksu_") ||
-			susfs_starts_with(iter->name, "susfs_") ||
-			susfs_starts_with(iter->name, "ksud") ||
-			susfs_starts_with(iter->name, "is_ksu_") ||
-			susfs_starts_with(iter->name, "is_manager_") ||
-			susfs_starts_with(iter->name, "escape_to_") ||
-			susfs_starts_with(iter->name, "setup_selinux") ||
-			susfs_starts_with(iter->name, "track_throne") ||
-			susfs_starts_with(iter->name, "on_post_fs_data") ||
-			susfs_starts_with(iter->name, "try_umount") ||
-			susfs_starts_with(iter->name, "kernelsu") ||
-			susfs_starts_with(iter->name, "__initcall__kmod_kernelsu") ||
-			susfs_starts_with(iter->name, "apply_kernelsu") ||
-			susfs_starts_with(iter->name, "handle_sepolicy") ||
-			susfs_starts_with(iter->name, "getenforce") ||
-			susfs_starts_with(iter->name, "setenforce") ||
-			susfs_starts_with(iter->name, "is_zygote"))
-		{
-			return 0;
-		}
-		seq_printf(m, "%px %c %s\n", value,
-			   iter->type, iter->name);
-	}
-#endif
 	return 0;
 }
 
